@@ -1,0 +1,136 @@
+# Tutorial 03 — Airflow & MLflow Integrated Stack
+#
+#   docker compose up -d --build
+#   docker compose ps
+#
+# MLflow UI:    http://127.0.0.1:15020
+# Airflow UI:   http://127.0.0.1:18080 (user: admin, see standalone_admin_password.txt)
+# MinIO UI:     http://127.0.0.1:19011 (login: minio / minio123 from .env)
+# Postgres:     localhost:15432        (psql -h localhost -p 15432 -U mlflow)
+
+name: ddm501-t03
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_DEFAULT_REGION: us-east-1
+  MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ddm501-t03-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  minio:
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:latest}
+    container_name: ddm501-t03-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "19010:9000"      # S3 API
+      - "19011:9001"      # Web Console
+    volumes:
+      - ./minio-data:/data
+    restart: unless-stopped
+
+  createbucket:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    image: ddm501-t03-mlflow:2.19.0
+    container_name: ddm501-t03-createbucket
+    depends_on:
+      - minio
+    environment:
+      <<: *s3-env
+      MLFLOW_BUCKET: ${MLFLOW_BUCKET}
+    command: ["python", "scripts/init_bucket.py"]
+    restart: "no"
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    image: ddm501-t03-mlflow:2.19.0
+    container_name: ddm501-t03-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-env
+    command:
+      - mlflow
+      - server
+      - --backend-store-uri
+      - postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - --default-artifact-root
+      - s3://${MLFLOW_BUCKET}/
+      - --no-serve-artifacts
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+    ports:
+      - "15020:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow:
+    build: .
+    image: ddm501-t03-airflow:2.8.4
+    container_name: ddm501-t03-airflow
+    command: standalone
+    ports:
+      - "18080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      <<: *s3-env
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME}
+      MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT}
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
