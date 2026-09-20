@@ -52,9 +52,6 @@ services:
     restart: unless-stopped
 
   createbucket:
-    build:
-      context: .
-      dockerfile: Dockerfile.mlflow
     image: ddm501-t03-mlflow:2.19.0
     container_name: ddm501-t03-createbucket
     depends_on:
@@ -62,13 +59,12 @@ services:
     environment:
       <<: *s3-env
       MLFLOW_BUCKET: ${MLFLOW_BUCKET}
+    volumes:
+      - ./scripts:/work/scripts
     command: ["python", "scripts/init_bucket.py"]
     restart: "no"
 
   mlflow:
-    build:
-      context: .
-      dockerfile: Dockerfile.mlflow
     image: ddm501-t03-mlflow:2.19.0
     container_name: ddm501-t03-mlflow
     depends_on:
